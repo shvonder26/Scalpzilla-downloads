@@ -36,12 +36,14 @@ jobs:
               const resp = await github.rest.repos.getLatestRelease({ owner, repo });
               release = resp && resp.data;
             }
+
             const assets = (release && release.assets) ? release.assets : [];
             const found = assets.find(a => (a && a.name || '').toLowerCase() === 'scalpzilla.zip');
             if (!found) {
               core.setFailed('Release asset scalpzilla.zip not found.');
               return;
             }
+
             core.setOutput('asset_api_url', found.url);
             core.setOutput('tag_name', (release && release.tag_name) ? String(release.tag_name) : '');
 
@@ -55,7 +57,7 @@ jobs:
             -o work/scalpzilla.zip
           ls -lah work/scalpzilla.zip
 
-      - name: Extract zip into work/extract (normalize \\ to /)
+      - name: Extract zip into work/extract (normalize \ to /)
         run: |
           set -euo pipefail
           python - << 'PY'
@@ -69,6 +71,7 @@ jobs:
           out.mkdir(parents=True, exist_ok=True)
 
           def normalize(name: str) -> str:
+              # Convert Windows paths to URL/posix style
               name = (name or "").replace("\\", "/")
               name = name.lstrip("/")
 
@@ -116,6 +119,10 @@ jobs:
 
           (Path("work") / "bundle_root.txt").write_text(str(root.as_posix()), "utf-8")
           print("bundle_root=", root)
+
+          print("Extract top-level:")
+          for p in sorted(out.iterdir()):
+              print(" -", p.name)
           PY
 
       - name: Copy bundle to site/latest
@@ -139,6 +146,9 @@ jobs:
                   shutil.copy2(child, target)
 
           print("Copied to", dst)
+          print("site/latest top-level:")
+          for p in sorted(dst.iterdir()):
+              print(" -", p.name)
           PY
 
       - name: Generate manifest.json
@@ -185,12 +195,42 @@ jobs:
           print("manifest files=", len(files))
           PY
 
-      - name: Validate published tree
+      - name: Validate published tree (with debug)
         run: |
           set -euo pipefail
-          test -f site/latest/Scalpzilla.exe
-          test -d site/latest/_internal
-          test -f site/latest/_internal/python311.dll
+
+          if [ ! -f site/latest/Scalpzilla.exe ]; then
+            echo "Missing site/latest/Scalpzilla.exe"
+            ls -lah site/latest || true
+            exit 1
+          fi
+
+          if [ ! -d site/latest/_internal ]; then
+            echo "Missing site/latest/_internal directory"
+            echo "Top-level site/latest listing:"
+            ls -lah site/latest || true
+
+            echo "Looking for files with backslashes in the filename (bad extraction symptom):"
+            python - << 'PY'
+            from pathlib import Path
+            root = Path("site/latest")
+            hits = []
+            for p in root.rglob("*"):
+              if p.is_file() and ("\\" in p.name):
+                hits.append(str(p))
+            print("\n".join(hits[:200]))
+            print("backslash_name_count=", len(hits))
+            PY
+
+            exit 1
+          fi
+
+          if [ ! -f site/latest/_internal/python311.dll ]; then
+            echo "Missing site/latest/_internal/python311.dll"
+            echo "Listing site/latest/_internal:"
+            ls -lah site/latest/_internal || true
+            exit 1
+          fi
 
           python - << 'PY'
           from pathlib import Path
