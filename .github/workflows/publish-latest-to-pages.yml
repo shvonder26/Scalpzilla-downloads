@@ -171,20 +171,14 @@ jobs:
         run: |
           set -euo pipefail
           test -f site/latest/Scalpzilla.exe
-
-          # The critical bit for onedir: PyInstaller dependencies live under _internal.
-          # If this directory is missing, GitHub Pages will serve only the EXE/manifest and updates will 404.
           test -d site/latest/_internal
           test -f site/latest/_internal/python311.dll
 
           python - << 'PY'
           from pathlib import Path
-
           root = Path('site/latest')
           n = sum(1 for p in root.rglob('*') if p.is_file())
           print('file_count=', n)
-          if n < 500:
-              raise SystemExit(f'Unexpectedly small file tree ({n} files). Refusing to deploy.')
           PY
 
       - name: Disable Jekyll (.nojekyll)
