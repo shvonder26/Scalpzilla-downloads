@@ -29,8 +29,6 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // For `release` events we can use the payload assets directly.
-            // For `workflow_dispatch` we query the latest release.
             let release = context.payload.release;
             if (!release) {
               const owner = context.repo.owner;
@@ -57,42 +55,67 @@ jobs:
             -o work/scalpzilla.zip
           ls -lah work/scalpzilla.zip
 
-      - name: Extract zip into work/extract
+      - name: Extract zip into work/extract (normalize \\ to /)
         run: |
           set -euo pipefail
           python - << 'PY'
+          import shutil
           import zipfile
           from pathlib import Path
 
-          z = Path('work/scalpzilla.zip')
-          out = Path('work/extract')
-          if out.exists():
-              import shutil
-              shutil.rmtree(out)
+          z = Path("work/scalpzilla.zip")
+          out = Path("work/extract")
+          shutil.rmtree(out, ignore_errors=True)
           out.mkdir(parents=True, exist_ok=True)
 
-          with zipfile.ZipFile(z, 'r') as zf:
-              zf.extractall(out)
+          def normalize(name: str) -> str:
+              name = (name or "").replace("\\", "/")
+              name = name.lstrip("/")
+
+              parts = []
+              for part in name.split("/"):
+                  if part in ("", "."):
+                      continue
+                  if part == "..":
+                      raise ValueError(f"Refusing path traversal entry: {name!r}")
+                  parts.append(part)
+              return "/".join(parts)
+
+          with zipfile.ZipFile(z, "r") as zf:
+              for info in zf.infolist():
+                  rel = normalize(info.filename)
+                  if not rel:
+                      continue
+
+                  is_dir = info.is_dir() or info.filename.endswith(("/", "\\"))
+                  dest = out / rel
+                  if is_dir:
+                      dest.mkdir(parents=True, exist_ok=True)
+                      continue
+
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  with zf.open(info, "r") as src, dest.open("wb") as dst:
+                      shutil.copyfileobj(src, dst)
 
           # Determine bundle root: either directly contains Scalpzilla.exe or a single child dir does.
-          exe = out / 'Scalpzilla.exe'
+          exe = out / "Scalpzilla.exe"
           if exe.is_file():
               root = out
           else:
               children = [p for p in out.iterdir() if p.is_dir()]
               root = None
-              if len(children) == 1 and (children[0] / 'Scalpzilla.exe').is_file():
+              if len(children) == 1 and (children[0] / "Scalpzilla.exe").is_file():
                   root = children[0]
               else:
                   for d in children:
-                      if (d / 'Scalpzilla.exe').is_file():
+                      if (d / "Scalpzilla.exe").is_file():
                           root = d
                           break
               if root is None:
-                  raise SystemExit('Could not find Scalpzilla.exe in extracted zip')
+                  raise SystemExit("Could not find Scalpzilla.exe in extracted zip")
 
-          (Path('work') / 'bundle_root.txt').write_text(str(root.as_posix()), 'utf-8')
-          print('bundle_root=', root)
+          (Path("work") / "bundle_root.txt").write_text(str(root.as_posix()), "utf-8")
+          print("bundle_root=", root)
           PY
 
       - name: Copy bundle to site/latest
@@ -102,12 +125,10 @@ jobs:
           import shutil
           from pathlib import Path
 
-          root = Path(Path('work/bundle_root.txt').read_text('utf-8').strip())
-          dst = Path('site/latest')
+          root = Path(Path("work/bundle_root.txt").read_text("utf-8").strip())
+          dst = Path("site/latest")
 
-          # Clean destination
-          if dst.exists():
-              shutil.rmtree(dst)
+          shutil.rmtree(dst, ignore_errors=True)
           dst.mkdir(parents=True, exist_ok=True)
 
           for child in root.iterdir():
@@ -117,7 +138,7 @@ jobs:
               else:
                   shutil.copy2(child, target)
 
-          print('Copied to', dst)
+          print("Copied to", dst)
           PY
 
       - name: Generate manifest.json
@@ -129,42 +150,39 @@ jobs:
           import time
           from pathlib import Path
 
-          root = Path('site/latest').resolve()
-          exe = root / 'Scalpzilla.exe'
+          root = Path("site/latest").resolve()
+          exe = root / "Scalpzilla.exe"
           if not exe.is_file():
-              raise SystemExit('site/latest missing Scalpzilla.exe')
+              raise SystemExit("site/latest missing Scalpzilla.exe")
 
           def sha256_file(p: Path) -> str:
               h = hashlib.sha256()
-              with p.open('rb') as f:
-                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+              with p.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
                       if not chunk:
                           break
                       h.update(chunk)
               return h.hexdigest().lower()
 
           files = {}
-          for p in root.rglob('*'):
+          for p in root.rglob("*"):
               if not p.is_file():
                   continue
-              rel = p.relative_to(root).as_posix().lstrip('/')
-              name = rel.rsplit('/', 1)[-1].lower()
-              if name.endswith('.part') or name.endswith('.tmp'):
+              rel = p.relative_to(root).as_posix().lstrip("/")
+              name = rel.rsplit("/", 1)[-1].lower()
+              if name.endswith(".part") or name.endswith(".tmp"):
                   continue
-              files[rel] = {
-                  'size': int(p.stat().st_size),
-                  'sha256': sha256_file(p),
-              }
+              files[rel] = {"size": int(p.stat().st_size), "sha256": sha256_file(p)}
 
           out = {
-              'schema': 1,
-              'generated_at_utc': int(time.time()),
-              'version': (('${{ steps.rel.outputs.tag_name }}' or '').lstrip('v')),
-              'files': files,
+              "schema": 1,
+              "generated_at_utc": int(time.time()),
+              "version": (("${{ steps.rel.outputs.tag_name }}" or "").lstrip("v")),
+              "files": files,
           }
 
-          (root / 'manifest.json').write_text(json.dumps(out, indent=2, sort_keys=True), 'utf-8')
-          print('manifest files=', len(files))
+          (root / "manifest.json").write_text(json.dumps(out, indent=2, sort_keys=True), "utf-8")
+          print("manifest files=", len(files))
           PY
 
       - name: Validate published tree
@@ -176,9 +194,9 @@ jobs:
 
           python - << 'PY'
           from pathlib import Path
-          root = Path('site/latest')
-          n = sum(1 for p in root.rglob('*') if p.is_file())
-          print('file_count=', n)
+          root = Path("site/latest")
+          n = sum(1 for p in root.rglob("*") if p.is_file())
+          print("file_count=", n)
           PY
 
       - name: Disable Jekyll (.nojekyll)
