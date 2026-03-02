@@ -4,9 +4,18 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to publish (e.g. v1.0.0.182). Leave blank to publish latest release."
+        required: false
+        default: ""
 
 # This workflow intentionally OVERWRITES the published Pages site on every run.
 # That guarantees the previous version's generated file tree is removed.
+#
+# IMPORTANT: If your repo's `github-pages` environment only allows deployments from `main`,
+# a `release` event (tag ref) will be blocked. To fix that, the `release` event here only
+# DISPATCHES a second run on `main` via workflow_dispatch, and only that `main` run deploys.
 permissions:
   contents: read
   pages: write
@@ -17,7 +26,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dispatch-from-release:
+    name: Dispatch publish on main
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Dispatch this workflow on main
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tagName = context.payload?.release?.tag_name || '';
+            if (!tagName) {
+              core.setFailed('No release tag_name found in payload.');
+              return;
+            }
+
+            // NOTE: This is the workflow FILE NAME in `.github/workflows/` in your downloads repo.
+            // Keep it in sync with whatever you name it there.
+            const workflowId = 'publish-latest-to-pages.yml';
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner,
+              repo,
+              workflow_id: workflowId,
+              ref: 'main',
+              inputs: {
+                tag_name: String(tagName),
+              },
+            });
+            core.notice(`Dispatched ${workflowId} on main for tag ${tagName}`);
+
   publish:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -39,12 +84,18 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // For `release` events we can use the payload assets directly.
-            // For `workflow_dispatch` we query the latest release.
-            let release = context.payload.release;
-            if (!release) {
-              const owner = context.repo.owner;
-              const repo = context.repo.repo;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // For `workflow_dispatch` we deploy from `main`, so there is no release payload.
+            // If an explicit tag_name is provided, resolve that specific release; otherwise use latest.
+            const inputTag = String((context.payload.inputs && context.payload.inputs.tag_name) ? context.payload.inputs.tag_name : '').trim();
+            let release = null;
+
+            if (inputTag) {
+              const resp = await github.rest.repos.getReleaseByTag({ owner, repo, tag: inputTag });
+              release = resp && resp.data;
+            } else {
               const resp = await github.rest.repos.getLatestRelease({ owner, repo });
               release = resp && resp.data;
             }
