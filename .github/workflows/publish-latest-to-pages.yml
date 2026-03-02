@@ -5,19 +5,24 @@ on:
     types: [published]
   workflow_dispatch:
 
+# This workflow intentionally OVERWRITES the published Pages site on every run.
+# That guarantees the previous version's generated file tree is removed.
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
   group: pages
   cancel-in-progress: true
 
 jobs:
-  build:
+  publish:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Prepare
         run: |
           set -euo pipefail
@@ -29,6 +34,8 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            // For `release` events we can use the payload assets directly.
+            // For `workflow_dispatch` we query the latest release.
             let release = context.payload.release;
             if (!release) {
               const owner = context.repo.owner;
@@ -57,83 +64,76 @@ jobs:
             -o work/scalpzilla.zip
           ls -lah work/scalpzilla.zip
 
-      - name: Extract zip into work/extract (normalize \ to /)
+      - name: Extract zip into work/extract
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import shutil
+          python - << 'PY'
           import zipfile
           from pathlib import Path
+          import shutil
 
-          z = Path("work/scalpzilla.zip")
-          out = Path("work/extract")
-          shutil.rmtree(out, ignore_errors=True)
+          z = Path('work/scalpzilla.zip')
+          out = Path('work/extract')
+          if out.exists():
+              shutil.rmtree(out)
           out.mkdir(parents=True, exist_ok=True)
 
-          def normalize(name: str) -> str:
-              name = (name or "").replace("\\", "/")
-              name = name.lstrip("/")
+          def safe_extract_member(zf: zipfile.ZipFile, member: zipfile.ZipInfo, dest: Path) -> None:
+            # GitHub Actions runs on Linux; if the ZIP was created on Windows, entries might
+            # contain backslashes. Python's extractall() treats backslashes as literal chars
+            # on Linux, which breaks directories like _internal/.
+            name = (member.filename or '').replace('\\', '/')
+            if not name or name.endswith('/'):
+              return
+            # Disallow absolute paths and traversal.
+            if name.startswith('/') or name.startswith('../') or '/..' in name:
+              raise SystemExit(f'Unsafe zip entry: {member.filename!r}')
 
-              parts = []
-              for part in name.split("/"):
-                  if part in ("", "."):
-                      continue
-                  if part == "..":
-                      raise ValueError(f"Refusing path traversal entry: {name!r}")
-                  parts.append(part)
-              return "/".join(parts)
+            target = (dest / name)
+            target_parent = target.parent
+            target_parent.mkdir(parents=True, exist_ok=True)
 
-          with zipfile.ZipFile(z, "r") as zf:
-              for info in zf.infolist():
-                  rel = normalize(info.filename)
-                  if not rel:
-                      continue
+            with zf.open(member, 'r') as src, target.open('wb') as dst:
+              shutil.copyfileobj(src, dst)
 
-                  is_dir = info.is_dir() or info.filename.endswith(("/", "\\"))
-                  dest = out / rel
-                  if is_dir:
-                      dest.mkdir(parents=True, exist_ok=True)
-                      continue
+          with zipfile.ZipFile(z, 'r') as zf:
+            for member in zf.infolist():
+              safe_extract_member(zf, member, out)
 
-                  dest.parent.mkdir(parents=True, exist_ok=True)
-                  with zf.open(info, "r") as src, dest.open("wb") as dst:
-                      shutil.copyfileobj(src, dst)
-
-          exe = out / "Scalpzilla.exe"
+          # Determine bundle root: either directly contains Scalpzilla.exe or a single child dir does.
+          exe = out / 'Scalpzilla.exe'
           if exe.is_file():
               root = out
           else:
               children = [p for p in out.iterdir() if p.is_dir()]
               root = None
-              if len(children) == 1 and (children[0] / "Scalpzilla.exe").is_file():
+              if len(children) == 1 and (children[0] / 'Scalpzilla.exe').is_file():
                   root = children[0]
               else:
                   for d in children:
-                      if (d / "Scalpzilla.exe").is_file():
+                      if (d / 'Scalpzilla.exe').is_file():
                           root = d
                           break
               if root is None:
-                  raise SystemExit("Could not find Scalpzilla.exe in extracted zip")
+                  raise SystemExit('Could not find Scalpzilla.exe in extracted zip')
 
-          (Path("work") / "bundle_root.txt").write_text(str(root.as_posix()), "utf-8")
-          print("bundle_root=", root)
-
-          print("Extract top-level:")
-          for p in sorted(out.iterdir()):
-              print(" -", p.name)
+          (Path('work') / 'bundle_root.txt').write_text(str(root.as_posix()), 'utf-8')
+          print('bundle_root=', root)
           PY
 
       - name: Copy bundle to site/latest
         run: |
           set -euo pipefail
-          python - <<'PY'
+          python - << 'PY'
           import shutil
           from pathlib import Path
 
-          root = Path(Path("work/bundle_root.txt").read_text("utf-8").strip())
-          dst = Path("site/latest")
+          root = Path(Path('work/bundle_root.txt').read_text('utf-8').strip())
+          dst = Path('site/latest')
 
-          shutil.rmtree(dst, ignore_errors=True)
+          # Clean destination
+          if dst.exists():
+              shutil.rmtree(dst)
           dst.mkdir(parents=True, exist_ok=True)
 
           for child in root.iterdir():
@@ -143,67 +143,102 @@ jobs:
               else:
                   shutil.copy2(child, target)
 
-          print("Copied to", dst)
-          print("site/latest top-level:")
-          for p in sorted(dst.iterdir()):
-              print(" -", p.name)
+          print('Copied to', dst)
           PY
 
       - name: Generate manifest.json
         run: |
           set -euo pipefail
-          python - <<'PY'
+          python - << 'PY'
           import hashlib
           import json
           import time
           from pathlib import Path
 
-          root = Path("site/latest").resolve()
-          exe = root / "Scalpzilla.exe"
+          root = Path('site/latest').resolve()
+          exe = root / 'Scalpzilla.exe'
           if not exe.is_file():
-              raise SystemExit("site/latest missing Scalpzilla.exe")
+              raise SystemExit('site/latest missing Scalpzilla.exe')
 
           def sha256_file(p: Path) -> str:
               h = hashlib.sha256()
-              with p.open("rb") as f:
-                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+              with p.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
                       if not chunk:
                           break
                       h.update(chunk)
               return h.hexdigest().lower()
 
           files = {}
-          for p in root.rglob("*"):
+          for p in root.rglob('*'):
               if not p.is_file():
                   continue
-              rel = p.relative_to(root).as_posix().lstrip("/")
-              name = rel.rsplit("/", 1)[-1].lower()
-              if name.endswith(".part") or name.endswith(".tmp"):
+              rel = p.relative_to(root).as_posix().lstrip('/')
+              name = rel.rsplit('/', 1)[-1].lower()
+              if name.endswith('.part') or name.endswith('.tmp'):
                   continue
-              files[rel] = {"size": int(p.stat().st_size), "sha256": sha256_file(p)}
+              files[rel] = {
+                  'size': int(p.stat().st_size),
+                  'sha256': sha256_file(p),
+              }
 
           out = {
-              "schema": 1,
-              "generated_at_utc": int(time.time()),
-              "version": (("${{ steps.rel.outputs.tag_name }}" or "").lstrip("v")),
-              "files": files,
+              'schema': 1,
+              'generated_at_utc': int(time.time()),
+              'version': (('${{ steps.rel.outputs.tag_name }}' or '').lstrip('v')),
+              'files': files,
           }
 
-          (root / "manifest.json").write_text(json.dumps(out, indent=2, sort_keys=True), "utf-8")
-          print("manifest files=", len(files))
+          (root / 'manifest.json').write_text(json.dumps(out, indent=2, sort_keys=True), 'utf-8')
+          print('manifest files=', len(files))
           PY
 
       - name: Validate published tree
         run: |
           set -euo pipefail
-          test -f site/latest/Scalpzilla.exe
-          test -d site/latest/_internal
-          test -f site/latest/_internal/python311.dll
-          python - <<'PY'
+          if [ ! -f site/latest/Scalpzilla.exe ]; then
+            echo 'Missing site/latest/Scalpzilla.exe'
+            ls -lah site/latest || true
+            exit 1
+          fi
+
+          # The critical bit for onedir: PyInstaller dependencies live under _internal.
+          # If this directory is missing, GitHub Pages will serve only the EXE/manifest and updates will 404.
+          if [ ! -d site/latest/_internal ]; then
+            echo 'Missing site/latest/_internal directory'
+            echo 'Top-level site/latest listing:'
+            ls -lah site/latest || true
+
+            echo 'Files with backslashes in their names (symptom of Windows-path ZIP extraction on Linux):'
+            python - <<'PY'
+            from pathlib import Path
+
+            root = Path('site/latest')
+            hits = []
+            for p in root.rglob('*'):
+              if p.is_file() and ('\\' in p.name):
+                hits.append(str(p))
+
+            print('\n'.join(hits[:200]))
+            print('backslash_name_count=', len(hits))
+            PY
+
+            exit 1
+          fi
+
+          if [ ! -f site/latest/_internal/python311.dll ]; then
+            echo 'Missing site/latest/_internal/python311.dll'
+            echo 'Listing site/latest/_internal:'
+            ls -lah site/latest/_internal || true
+            exit 1
+          fi
+
+          python - << 'PY'
           from pathlib import Path
-          root = Path("site/latest")
-          n = sum(1 for p in root.rglob("*") if p.is_file())
-          print("file_count=", n)
+
+          root = Path('site/latest')
+          n = sum(1 for p in root.rglob('*') if p.is_file())
+          print('file_count=', n)
           PY
 
       - name: Disable Jekyll (.nojekyll)
@@ -211,18 +246,16 @@ jobs:
           set -euo pipefail
           touch site/.nojekyll
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
+      - name: Remove any other published trees
+        run: |
+          set -euo pipefail
+          find site -mindepth 1 -maxdepth 1 ! -name latest ! -name .nojekyll -exec rm -rf {} +
 
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Deploy (overwrite entire site)
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: site
+          force_orphan: true
+          commit_message: "Publish latest tree for ${{ steps.rel.outputs.tag_name }}"
