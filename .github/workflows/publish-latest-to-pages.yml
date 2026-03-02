@@ -8,7 +8,9 @@ on:
 # This workflow intentionally OVERWRITES the published Pages site on every run.
 # That guarantees the previous version's generated file tree is removed.
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 concurrency:
   group: pages
@@ -17,6 +19,9 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -240,11 +245,14 @@ jobs:
           set -euo pipefail
           find site -mindepth 1 -maxdepth 1 ! -name latest ! -name .nojekyll -exec rm -rf {} +
 
-      - name: Deploy (overwrite entire site)
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_branch: gh-pages
-          publish_dir: site
-          force_orphan: true
-          commit_message: "Publish latest tree for ${{ steps.rel.outputs.tag_name }}"
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
