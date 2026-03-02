@@ -210,18 +210,7 @@ jobs:
             ls -lah site/latest || true
 
             echo 'Files with backslashes in their names (symptom of Windows-path ZIP extraction on Linux):'
-            python - <<'PY'
-            from pathlib import Path
-
-            root = Path('site/latest')
-            hits = []
-            for p in root.rglob('*'):
-              if p.is_file() and ('\\' in p.name):
-                hits.append(str(p))
-
-            print('\n'.join(hits[:200]))
-            print('backslash_name_count=', len(hits))
-            PY
+            python -c "from pathlib import Path; root=Path('site/latest'); hits=[str(p) for p in root.rglob('*') if p.is_file() and ('\\\\' in p.name)]; print('\\n'.join(hits[:200])); print('backslash_name_count=', len(hits))"
 
             exit 1
           fi
